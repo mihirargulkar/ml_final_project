@@ -1,7 +1,11 @@
-"""Compute 30/60/90 calendar-day close-to-close returns for insider trades.
+"""Compute 1/2/3-month (30/60/90 calendar day) close-to-close returns for insider trades.
 
-Sequential, per-ticker downloads (no batching) with throttling to ~50 calls/min.
-Outputs a new CSV `insider_trades_with_returns.csv` alongside the source file.
+The script reads `insider_trades.csv`, fetches historical Close prices from
+Yahoo Finance via `yfinance`, and appends `return_30d_close`, `return_60d_close`,
+and `return_90d_close`. For each row, it uses the last available trading Close
+on or before `trade_date` and on or before `trade_date + N days` (N in
+{30, 60, 90}). Missing prices fall back to the nearest previous trading day; if
+none exist the return remains NaN.
 """
 
 from __future__ import annotations
@@ -17,15 +21,18 @@ import pandas as pd
 import yfinance as yf
 
 ROOT = Path(__file__).resolve().parent
-SRC_CSV = ROOT / "insider_trades.csv"
-OUT_CSV = ROOT / "insider_trades_with_returns.csv"
+CSV_PATH = ROOT / "insider_trades.csv"
 WINDOWS = [30, 60, 90]  # calendar days
 RETURN_COLS = {w: f"return_{w}d_close" for w in WINDOWS}
-THROTTLE_SEC = 1.2  # ~50 calls/min safety
+THROTTLE_SEC = 1.1  # sleep between batch downloads to stay under 60 calls/min
+RATE_LIMIT_BACKOFF_SEC = 60  # base backoff when Yahoo rate limits
+RATE_LIMIT_RETRIES = 3
+BATCH_SIZE = 40  # tickers per multi-download call (60 calls/min budget)
+CACHE_DIR = ROOT / "data_cache"
 BUFFER_DAYS_BEFORE = 10
 BUFFER_DAYS_AFTER = 5
+
 VALID_TICKER_RE = re.compile(r"^[A-Za-z0-9.\-]+$")
-FLUSH_EVERY = 50  # write partial progress every N tickers
 
 
 def normalize_ticker(ticker: str) -> str:
@@ -35,7 +42,7 @@ def normalize_ticker(ticker: str) -> str:
 def is_valid_ticker(ticker: str) -> bool:
     if not ticker:
         return False
-    if ticker.startswith("$"):  # skip OTC-like
+    if ticker.startswith("$"):  # many delisted/OTC symbols in this dataset
         return False
     if ticker in {".", "--"}:
         return False
@@ -46,29 +53,81 @@ def is_valid_ticker(ticker: str) -> bool:
     return True
 
 
+def ensure_cache_dir() -> None:
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def cache_path_for(ticker: str) -> Path:
+    return CACHE_DIR / f"{ticker}.parquet"
+
+
+def load_cached_prices(ticker: str) -> Optional[pd.DataFrame]:
+    path = cache_path_for(ticker)
+    if path.exists():
+        try:
+            df = pd.read_parquet(path)
+            return df
+        except Exception:  # noqa: BLE001
+            return None
+    return None
+
+
+def save_cached_prices(ticker: str, df: pd.DataFrame) -> None:
+    ensure_cache_dir()
+    path = cache_path_for(ticker)
+    try:
+        df.to_parquet(path, index=False)
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def download_prices(
     ticker: str, start: pd.Timestamp, end: pd.Timestamp
 ) -> Tuple[Optional[pd.DataFrame], Optional[str]]:
-    """Download Close prices for a ticker between start and end (inclusive-ish)."""
-    symbols = [ticker]
-    if "." in ticker:
-        symbols.append(ticker.replace(".", "-"))
+    """Download Close prices for a ticker between start and end (inclusive-ish).
 
-    for sym in symbols:
-        try:
-            hist = (
-                yf.Ticker(sym)
-                .history(
-                    start=start.date(),
-                    end=(end + timedelta(days=1)).date(),  # end is exclusive
-                    auto_adjust=False,
-                    actions=False,
+    Returns (price_df, used_symbol). price_df has columns [price_date, close].
+    Tries a dash-version fallback when the ticker contains dots.
+    """
+    candidates = [ticker]
+    dash_ticker = ticker.replace(".", "-")
+    if dash_ticker != ticker:
+        candidates.append(dash_ticker)
+
+    for symbol in candidates:
+        backoff = RATE_LIMIT_BACKOFF_SEC
+        for attempt in range(1, RATE_LIMIT_RETRIES + 1):
+            try:
+                hist = (
+                    yf.Ticker(symbol)
+                    .history(
+                        start=start.date(),
+                        end=(end + timedelta(days=1)).date(),  # history end is exclusive
+                        auto_adjust=False,
+                        actions=False,
+                    )
+                    .reset_index()
                 )
-                .reset_index()
-            )
-        except Exception as exc:  # noqa: BLE001
-            print(f"[warn] failed to download {sym}: {exc}")
-            continue
+            except Exception as exc:  # noqa: BLE001
+                msg = str(exc)
+                if "Too Many Requests" in msg or "rate limit" in msg.lower():
+                    wait = backoff * attempt
+                    print(f"[ratelimit] {symbol} attempt {attempt}/{RATE_LIMIT_RETRIES}; sleeping {wait}s")
+                    time.sleep(wait)
+                    continue
+                print(f"[warn] failed to download {symbol}: {exc}")
+                hist = None
+
+            if hist is None or hist.empty or "Close" not in hist:
+                # If empty due to rate limit, retry; otherwise break
+                if attempt < RATE_LIMIT_RETRIES:
+                    wait = backoff * attempt
+                    print(f"[retry] {symbol} empty response; sleeping {wait}s")
+                    time.sleep(wait)
+                    continue
+                hist = None
+            # Successful or exhausted retries
+            break
 
         if hist is None or hist.empty or "Close" not in hist:
             continue
@@ -79,141 +138,204 @@ def download_prices(
         price_df["price_date"] = (
             pd.to_datetime(price_df["price_date"]).dt.tz_localize(None).dt.normalize()
         )
-        return price_df.sort_values("price_date"), sym
+        return price_df.sort_values("price_date"), symbol
 
     return None, None
 
 
-def ensure_return_columns(df: pd.DataFrame, windows: list[int]) -> None:
-    for w in windows:
-        col = RETURN_COLS[w]
-        if col not in df.columns:
-            df[col] = pd.NA
+def extract_close_frame(hist: pd.DataFrame, ticker: str) -> Optional[pd.DataFrame]:
+    """Extract price_date/close frame for a given ticker from a download result."""
+    if hist is None or hist.empty:
+        return None
+
+    # Single-ticker case
+    if not isinstance(hist.columns, pd.MultiIndex):
+        if "Close" not in hist:
+            return None
+        df = (
+            hist[["Close"]]
+            .reset_index()
+            .rename(columns={"Date": "price_date", "Close": "close"})
+            .dropna(subset=["close"])
+        )
+    else:
+        # Multi-ticker case; yfinance uses (ticker, field)
+        cols = hist.columns
+        if (ticker, "Close") in cols:
+            close_series = hist[(ticker, "Close")]
+        elif ("Close", ticker) in cols:
+            close_series = hist[("Close", ticker)]
+        else:
+            return None
+        df = (
+            close_series.reset_index()
+            .rename(columns={"Date": "price_date", close_series.name: "close"})
+            .dropna(subset=["close"])
+        )
+
+    df["price_date"] = pd.to_datetime(df["price_date"]).dt.tz_localize(None).dt.normalize()
+    return df[["price_date", "close"]].sort_values("price_date")
 
 
-def compute_returns(df: pd.DataFrame, windows: Optional[list[int]] = None, flush_path: Optional[Path] = None) -> pd.DataFrame:
-    """Compute forward returns per row for requested windows (in days), resuming from existing values."""
+def download_batch(
+    tickers: list[str], start: pd.Timestamp, end: pd.Timestamp
+) -> Dict[str, Optional[pd.DataFrame]]:
+    """Download Close prices for a batch of tickers in one call."""
+    results: Dict[str, Optional[pd.DataFrame]] = {t: None for t in tickers}
+    backoff = RATE_LIMIT_BACKOFF_SEC
+    for attempt in range(1, RATE_LIMIT_RETRIES + 1):
+        try:
+            hist = yf.download(
+                tickers=tickers,
+                start=start.date(),
+                end=(end + timedelta(days=1)).date(),  # end is exclusive
+                group_by="ticker",
+                auto_adjust=False,
+                actions=False,
+                progress=False,
+                threads=False,
+            )
+        except Exception as exc:  # noqa: BLE001
+            msg = str(exc)
+            if "Too Many Requests" in msg or "rate limit" in msg.lower():
+                wait = backoff * attempt
+                print(f"[ratelimit] batch {attempt}/{RATE_LIMIT_RETRIES}; sleeping {wait}s")
+                time.sleep(wait)
+                continue
+            print(f"[warn] batch download failed: {exc}")
+            hist = None
+
+        if hist is None or hist.empty:
+            if attempt < RATE_LIMIT_RETRIES:
+                wait = backoff * attempt
+                print(f"[retry] empty batch response; sleeping {wait}s")
+                time.sleep(wait)
+                continue
+        # Success or exhausted retries; break to parse whatever we have
+        break
+
+    if hist is None or hist.empty:
+        return results
+
+    for t in tickers:
+        df_t = extract_close_frame(hist, t)
+        results[t] = df_t
+    return results
+
+
+def compute_returns(df: pd.DataFrame, windows: Optional[list[int]] = None) -> pd.DataFrame:
+    """Compute forward returns per row for the requested windows (in days)."""
     if "trade_date" not in df.columns or "ticker" not in df.columns:
         raise ValueError("Expected columns 'trade_date' and 'ticker' in input CSV")
 
     if windows is None:
         windows = WINDOWS
+
     windows = sorted(set(int(w) for w in windows))
+    if not windows:
+        raise ValueError("No windows specified")
 
-    ensure_return_columns(df, windows)
-
+    # Normalize ticker/text fields and dates
     tickers_clean = df["ticker"].apply(normalize_ticker)
     trade_dt = pd.to_datetime(df["trade_date"], errors="coerce").dt.normalize()
     target_dt_by_window = {w: trade_dt + pd.Timedelta(days=w) for w in windows}
 
-    # Determine which tickers still need processing (any NA in return cols for that ticker)
-    return_cols = [RETURN_COLS[w] for w in windows]
-    tickers = []
-    skipped = 0
-    for t in tickers_clean.dropna().unique():
-        if not is_valid_ticker(t):
-            continue
-        mask = tickers_clean == t
-        needs = df.loc[mask, return_cols].isna().any(axis=1).any()
-        if needs:
-            tickers.append(t)
-        else:
-            skipped += 1
+    returns_df = pd.DataFrame(index=df.index, dtype="float64")
+    tickers = [t for t in tickers_clean.dropna().unique() if is_valid_ticker(t)]
 
-    print(f"[info] processing {len(tickers)} tickers across {len(df)} rows (skipped already-complete: {skipped})")
+    if not tickers:
+        print("[info] no valid tickers to process")
+        return returns_df
 
-    for i, ticker in enumerate(sorted(tickers)):
+    # Compute per-ticker download windows
+    window_bounds: Dict[str, Tuple[pd.Timestamp, pd.Timestamp]] = {}
+    for ticker in tickers:
         mask = tickers_clean == ticker
         trade_dates = trade_dt.loc[mask]
         if trade_dates.isna().all():
             continue
-
         start = trade_dates.min() - pd.Timedelta(days=BUFFER_DAYS_BEFORE)
         end_candidates = [target_dt_by_window[w].loc[mask].max() for w in windows]
         end_max = pd.Series(end_candidates).max()
         end = end_max + pd.Timedelta(days=BUFFER_DAYS_AFTER)
+        window_bounds[ticker] = (start, end)
 
-        price_df, used_symbol = download_prices(ticker, start, end)
-        time.sleep(THROTTLE_SEC)
+    # Load from cache and prepare batches for missing tickers
+    price_cache: Dict[str, pd.DataFrame] = {}
+    missing: list[str] = []
+    for t in tickers:
+        cached = load_cached_prices(t)
+        if cached is not None and not cached.empty:
+            price_cache[t] = cached
+        else:
+            missing.append(t)
 
+    batches = [missing[i : i + BATCH_SIZE] for i in range(0, len(missing), BATCH_SIZE)]
+    for b_idx, batch in enumerate(batches, 1):
+        if not batch:
+            continue
+        batch_start = min(window_bounds[t][0] for t in batch)
+        batch_end = max(window_bounds[t][1] for t in batch)
+        print(f"[info] downloading batch {b_idx}/{len(batches)} ({len(batch)} tickers)")
+        batch_data = download_batch(batch, batch_start, batch_end)
+        for t, df_prices in batch_data.items():
+            if df_prices is not None and not df_prices.empty:
+                price_cache[t] = df_prices
+                save_cached_prices(t, df_prices)
+        if THROTTLE_SEC > 0:
+            time.sleep(THROTTLE_SEC)
+
+    print(f"[info] processing {len(tickers)} tickers across {len(df)} rows for windows {windows}")
+
+    for i, ticker in enumerate(sorted(tickers)):
+        price_df = price_cache.get(ticker)
         if price_df is None or price_df.empty:
             print(f"[warn] no price data for {ticker}")
             continue
 
-        # Entry prices via merge_asof (handles gaps cleanly)
-        entry = (
-            pd.merge_asof(
-                trade_dates.reset_index().sort_values("trade_date"),
-                price_df,
-                left_on="trade_date",
-                right_on="price_date",
-                direction="backward",
-            )
-            .set_index("index")["close"]
-            .reindex(trade_dates.index)
-        )
+        mask = tickers_clean == ticker
+        trade_dates = trade_dt.loc[mask]
+        price_series = price_df.set_index("price_date")["close"].sort_index()
 
-        for w in windows:
-            target_dates = target_dt_by_window[w].loc[mask]
-            target = (
-                pd.merge_asof(
-                    target_dates.reset_index().sort_values(target_dates.name),
-                    price_df,
-                    left_on=target_dates.name,
-                    right_on="price_date",
-                    direction="backward",
-                )
-                .set_index("index")["close"]
-                .reindex(target_dates.index)
-            )
+        # Entry prices: last close on/before trade_date
+        trade_sorted = trade_dates.sort_values()
+        entry_vals = price_series.reindex(trade_sorted, method="ffill").to_numpy()
+        entry = pd.Series(entry_vals, index=trade_sorted.index).reindex(trade_dates.index)
+
+        for window in windows:
+            target_dates = target_dt_by_window[window].loc[mask]
+            target_sorted = target_dates.sort_values()
+            target_vals = price_series.reindex(target_sorted, method="ffill").to_numpy()
+            target = pd.Series(target_vals, index=target_sorted.index).reindex(target_dates.index)
 
             ticker_returns = (target - entry) / entry
-            df.loc[mask, RETURN_COLS[w]] = ticker_returns.values
-
-        if (i + 1) % FLUSH_EVERY == 0 and flush_path:
-            df.to_csv(flush_path, index=False)
-            print(f"[info] flushed progress at {i + 1}/{len(tickers)} tickers to {flush_path}")
+            returns_df.loc[ticker_returns.index, RETURN_COLS[window]] = ticker_returns
 
         if (i + 1) % 50 == 0 or i == len(tickers) - 1:
-            print(f"[info] processed {i + 1}/{len(tickers)} tickers (last: {used_symbol or ticker})")
+            print(f"[info] processed {i + 1}/{len(tickers)} tickers (last: {ticker})")
 
-    return df
+    return returns_df
 
 
-def main(src: Path = SRC_CSV, out: Path = OUT_CSV) -> None:
-    if not src.exists():
-        raise FileNotFoundError(f"CSV not found: {src}")
+def main(csv_path: Path = CSV_PATH) -> None:
+    if not csv_path.exists():
+        raise FileNotFoundError(f"CSV not found: {csv_path}")
 
-    df = pd.read_csv(src)
-    print(f"[info] loaded source {src}")
+    df = pd.read_csv(csv_path)
 
-    # If an output file exists, pre-fill returns from it using (transaction_date, trade_date, ticker)
-    if out.exists():
-        print(f"[info] found existing {out}; pre-filling returns")
-        prev = pd.read_csv(out)
-        ensure_return_columns(df, WINDOWS)
-        ensure_return_columns(prev, WINDOWS)
-        key_cols = ["transaction_date", "trade_date", "ticker"]
-        df["_key"] = df[key_cols].astype(str).agg("|".join, axis=1)
-        prev["_key"] = prev[key_cols].astype(str).agg("|".join, axis=1)
-        prev_returns = (
-            prev.drop_duplicates("_key")
-            .set_index("_key")[[RETURN_COLS[w] for w in WINDOWS]]
-        )
-        for w, col in RETURN_COLS.items():
-            if col in prev_returns:
-                returns_map = prev_returns[col].to_dict()
-                df[col] = df[col].combine_first(df["_key"].map(returns_map))
-        df.drop(columns=["_key"], inplace=True)
-
-    df = compute_returns(df, windows=WINDOWS, flush_path=out)
-
-    df.to_csv(out, index=False)
-    print(f"[done] wrote {out}")
+    returns_df = compute_returns(df, windows=WINDOWS)
     for w, col in RETURN_COLS.items():
-        filled = df[col].notna().sum()
-        missing = df[col].isna().sum()
-        print(f"[stats] {col}: rows={len(df)}, filled={filled}, missing={missing}")
+        df[col] = returns_df.get(col, pd.NA)
+
+    filled = {col: df[col].notna().sum() for col in RETURN_COLS.values()}
+    missing = {col: df[col].isna().sum() for col in RETURN_COLS.values()}
+
+    df.to_csv(csv_path, index=False)
+
+    print(f"[done] wrote {csv_path}")
+    print(f"[stats] rows={len(df)}")
+    for w, col in RETURN_COLS.items():
+        print(f"  {col}: filled={filled[col]}, missing={missing[col]}")
     preview_cols = ["ticker", "trade_date"] + list(RETURN_COLS.values())
     print(df[preview_cols].head(10))
 
