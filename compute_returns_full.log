@@ -1,0 +1,7 @@
+[info] loading CSV...
+[info] computing returns...
+[info] downloading batch 1/229 (40 tickers)
+
+40 Failed downloads:
+['AROW', 'HASI', 'BXC', 'SRYB', 'SYBT', 'NTS', 'FMNB', 'RBCAA', 'NBBC', 'SVBL', 'ROIQ', 'OME', 'PW', 'ETEC', 'AGCO', 'CBMG', 'GORO', 'SPRT', 'STRM', 'CRVP', 'FAST', 'FSGI', 'NWIN', 'DG', 'TEX', 'BLK', 'QTM', 'RALY', 'IBTX', 'UFCS', 'NFTI', 'MVBF', 'ENBP', 'MRC', 'OVTZ', 'BLFS', 'BOTJ', 'VSYS', 'TELOZ', 'YELP']: YFRateLimitError('Too Many Requests. Rate limited. Try after a while.')
+[retry] empty batch response; sleeping 60s
